@@ -60,12 +60,9 @@ def detect_columns(df, group_row_idx, subheader_row_idx):
         # Skip Inspection 2 (handling / extra packaging)
         if re.search(r"Inspection\s*2\b", label, re.I):
             continue
-        # Skip Inspection 4 (not used)
-        if re.search(r"Inspection\s*4\b", label, re.I):
-            continue
 
         is_rework = bool(re.search(r"rework|reworking", label, re.I))
-        is_insp   = bool(re.search(r"Inspection\s*[13]", label, re.I))
+        is_insp   = bool(re.search(r"Inspection\s*\d+", label, re.I))
 
         if not (is_rework or is_insp):
             continue
