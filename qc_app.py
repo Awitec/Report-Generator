@@ -97,6 +97,27 @@ def detect_columns(df, group_row_idx, subheader_row_idx):
     return detections, total_col
 
 
+def get_rework_linked_nok_keys(inspections, rework_list):
+    """
+    Returns the set of key_nok for inspections whose NOK feeds into rework.
+    Matched by name overlap between inspection label and rework label.
+    E.g. 'Wheel hub damages' ↔ 'Wheel hub rework' → linked.
+    """
+    stop = {"", "and", "of", "the", "a", "an", "in", "for"}
+    linked = set()
+    for rw in rework_list:
+        rw_words = set(re.sub(r"[^a-z\s]", "", rw["label"].lower()).split()) - stop
+        best, best_score = None, 0
+        for insp in inspections:
+            insp_words = set(re.sub(r"[^a-z\s]", "", insp["label"].lower()).split()) - stop
+            score = len(rw_words & insp_words)
+            if score > best_score:
+                best_score, best = score, insp
+        if best and best_score > 0:
+            linked.add(best["key_nok"])
+    return linked
+
+
 def is_valid_partno(val):
     """Filter out non-part-number rows (e.g. free-text notes)."""
     s = str(val).strip()
@@ -336,8 +357,13 @@ def generate_report(info):
 
     # Data rows
     DATA_START = 4
-    nok_keys    = [d["key_nok"] for d in inspections]
-    rw_ok_keys  = [d["key_ok"]  for d in rework_list]
+    # Inspections whose NOK feeds into rework are excluded from Total NOK;
+    # instead Rework NOK is used (avoids double-counting parts that fail both
+    # the rework-linked inspection AND another inspection).
+    linked_nok_keys = get_rework_linked_nok_keys(inspections, rework_list)
+    direct_nok_keys = [d["key_nok"] for d in inspections if d["key_nok"] not in linked_nok_keys]
+    rw_nok_keys     = [d["key_nok"] for d in rework_list]
+    all_tnok_keys   = direct_nok_keys + rw_nok_keys  # used for Total NOK formula
 
     def total_col_ci():
         return next(i+1 for i,c in enumerate(cols) if c["key"]=="total")
@@ -350,7 +376,7 @@ def generate_report(info):
         rd  = row._asdict()
         pno = rd.get("partno", "")
         is_rw_part = pno in rework_parts
-        total_nok  = sum(rd.get(k, 0) for k in nok_keys) - sum(rd.get(k, 0) for k in rw_ok_keys)
+        total_nok  = sum(rd.get(k, 0) for k in all_tnok_keys)
         has_nok    = total_nok > 0
         bg = C_HIGHLIGHT if (is_rw_part and multi_part) else (C_ODD if idx%2==0 else C_WHITE)
 
@@ -377,9 +403,10 @@ def generate_report(info):
                 c.fill = fl(bg); c.border = th(); c.alignment = ctr()
 
             elif key == "total_nok":
-                formula = "+".join(f"{get_column_letter(next(i+1 for i,c2 in enumerate(cols) if c2['key']==k))}{r}" for k in nok_keys)
-                if rw_ok_keys:
-                    formula += "-" + "-".join(f"{get_column_letter(next(i+1 for i,c2 in enumerate(cols) if c2['key']==k))}{r}" for k in rw_ok_keys)
+                formula = "+".join(
+                    f"{get_column_letter(next(i+1 for i,c2 in enumerate(cols) if c2['key']==k))}{r}"
+                    for k in all_tnok_keys
+                )
                 c.value = f"={formula}"
                 c.number_format = "#,##0"; c.font = fnt(bold=True)
                 c.fill = fl("FFD0D0"); c.border = th(); c.alignment = ctr()
@@ -507,9 +534,6 @@ def generate_report(info):
                 c.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
                 c.fill = fl(bg_c)
 
-        insp_nok_keys = [d["key_nok"] for d in inspections]
-        s_rw_ok_keys  = [d["key_ok"]  for d in rework_list]
-
         for idx, row in enumerate(by_part.itertuples(index=False)):
             r   = idx + 3
             ws2.row_dimensions[r].height = 18
@@ -517,8 +541,7 @@ def generate_report(info):
             pno = rd["partno"]
             is_rw_part = pno in rework_parts
             t   = int(rd["total"])
-            tnok = (sum(int(rd.get(k, 0)) for k in insp_nok_keys)
-                    - sum(int(rd.get(k, 0)) for k in s_rw_ok_keys))
+            tnok = sum(int(rd.get(k, 0)) for k in all_tnok_keys)
             bg  = C_HIGHLIGHT if is_rw_part else (C_ODD if idx%2==0 else C_WHITE)
 
             for ci2, col in enumerate(s_cols, 1):
