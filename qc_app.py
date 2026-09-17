@@ -111,27 +111,71 @@ def is_valid_partno(val):
 
 
 # ── File parsing ──────────────────────────────────────────────────────────────
-def parse_file(uploaded_file):
-    df = pd.read_excel(uploaded_file, sheet_name="Order Awitec", header=None)
+SHEET_NAME = "Order Awitec"
 
-    subheader_row = next(
-        (i for i, row in df.iterrows() if any("Pieces to check" in str(v) for v in row.values)),
-        None
-    )
+
+def _norm(val):
+    """Normalise a cell for tolerant label matching: lowercase, and collapse
+    whitespace including non-breaking spaces and line breaks. Lets us find
+    'TOTAL  QUANTITY' and 'Total\\nQuantity' just like 'Total Quantity'."""
+    return re.sub(r"\s+", " ", str(val).replace("\xa0", " ")).strip().lower()
+
+
+def _find_row(df, *labels):
+    """Index of the first row containing any of the labels, else None."""
+    wanted = [_norm(l) for l in labels]
+    for i, row in df.iterrows():
+        for v in row.values:
+            n = _norm(v)
+            if n and any(w in n for w in wanted):
+                return i
+    return None
+
+
+def _cell_ref(row_idx, col_idx):
+    """pandas indices -> Excel reference, so errors can name the exact cell."""
+    return f"{get_column_letter(col_idx + 1)}{row_idx + 1}"
+
+
+def parse_file(uploaded_file):
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name=SHEET_NAME, header=None)
+    except ValueError:
+        try:
+            found = ", ".join(f"'{s}'" for s in pd.ExcelFile(uploaded_file).sheet_names)
+        except Exception:
+            found = "none could be read"
+        return None, (f"This file has no sheet named '{SHEET_NAME}'. "
+                      f"Sheets found: {found}. Did you upload the QC report "
+                      f"instead of the Awitec inspection file?")
+
+    subheader_row = _find_row(df, "Pieces to check")
     if subheader_row is None:
-        return None, "Could not find header row ('Pieces to check')."
+        return None, (f"Could not find the header row in sheet '{SHEET_NAME}'. "
+                      f"A cell must contain 'Pieces to check' — that label marks "
+                      f"where the data table starts.")
 
     group_row = subheader_row - 1
-    total_row_idx = next(
-        (i for i, row in df.iterrows() if any("Total Quantity" in str(v) for v in row.values)),
-        None
-    )
-    if total_row_idx is None:
-        return None, "Could not find total row ('Total Quantity')."
 
-    # Metadata
+    # End of the data block. Normally labelled 'Total Quantity'. If that label
+    # was cleared, fall back to the row above 'Total Price', which sits directly
+    # underneath it in the Awitec template.
+    total_row_idx = _find_row(df, "Total Quantity", "Gesamtmenge")
+    if total_row_idx is None:
+        price_row = _find_row(df, "Total Price")
+        if price_row is not None and price_row - 1 > subheader_row:
+            total_row_idx = price_row - 1
+    if total_row_idx is None:
+        return None, (f"Could not find the total row in sheet '{SHEET_NAME}'. "
+                      f"The row closing the data table must be labelled "
+                      f"'Total Quantity' (column B, directly above 'Total Price'). "
+                      f"Please restore that label and upload again.")
+
+    # Metadata. Stop above the group-header row: it repeats 'Order/Job Number:'
+    # as a column caption, and four columns over sits 'Charge' — which would
+    # otherwise overwrite the real order number read from the header block.
     meta = {"order": "", "material": "", "description": ""}
-    for i, row in df.iloc[:subheader_row].iterrows():
+    for i, row in df.iloc[:group_row].iterrows():
         for j, v in enumerate(row):
             if not pd.notna(v): continue
             key = str(v).strip()
@@ -187,10 +231,26 @@ def parse_file(uploaded_file):
     for c in num_cols:
         data[c] = pd.to_numeric(data[c], errors="coerce").fillna(0).astype(int)
 
-    # Filter valid rows
+    # Filter valid rows. Each filter is guarded against an already-empty frame:
+    # .apply() on an empty column returns an empty object Series, which pandas
+    # would treat as a column selector and silently drop every column.
+    checked   = len(data)
+    undated   = int(data["date"].isna().sum())
     data = data[data["date"].notna()]
-    data = data[data["partno"].apply(is_valid_partno)]
-    data = data[data["total"] > 0]
+    if not data.empty:
+        data = data[data["partno"].apply(is_valid_partno)]
+    if not data.empty:
+        data = data[data["total"] > 0]
+
+    if data.empty:
+        if checked and undated == checked:
+            ref = _cell_ref(subheader_row + 1, 1)
+            return None, (f"No usable data rows: the inspection date is missing "
+                          f"in all {checked} rows (column starting at cell {ref}). "
+                          f"Please fill in the dates and upload again.")
+        return None, (f"No usable data rows between the header and the total row "
+                      f"({checked} rows checked). Check that the part numbers and "
+                      f"the 'Pieces to check' quantities are filled in.")
 
     # Detect which inspections/rework have actual data
     active = [d for d in detections if data[d["key_nok"]].sum() + data[d["key_ok"]].sum() > 0]
